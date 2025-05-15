@@ -46,6 +46,7 @@
 
 
 import argparse
+from collections import namedtuple
 from functools import partial
 from hashlib import blake2b
 import logging
@@ -55,7 +56,6 @@ import re
 import shutil
 import signal
 import sys
-from textwrap import fill
 import time
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -81,8 +81,8 @@ from picard.album import (
     run_album_post_removal_processors,
 )
 from picard.audit import setup_audit
-from picard.browser.browser import BrowserIntegration
 from picard.browser.filelookup import FileLookup
+from picard.browser.server import BrowserIntegration
 from picard.cluster import (
     Cluster,
     ClusterList,
@@ -94,7 +94,10 @@ from picard.config import (
     setup_config,
 )
 from picard.config_upgrade import upgrade_config
-from picard.const import USER_DIR
+from picard.const import (
+    BROWSER_INTEGRATION_LOCALHOST,
+    USER_DIR,
+)
 from picard.const.sys import (
     FROZEN_TEMP_PATH,
     IS_FROZEN,
@@ -123,6 +126,7 @@ from picard.pluginmanager import (
     plugin_dirs,
 )
 from picard.releasegroup import ReleaseGroup
+from picard.remotecommands import RemoteCommands
 from picard.track import (
     NonAlbumTrack,
     Track,
@@ -142,16 +146,7 @@ from picard.util import (
     versions,
     webbrowser2,
 )
-from picard.util.cdrom import (
-    DISCID_NOT_LOADED_MESSAGE,
-    discid as _discid,
-    get_cdrom_drives,
-)
 from picard.util.checkupdate import UpdateCheckManager
-from picard.util.remotecommands import (
-    REMOTE_COMMANDS,
-    RemoteCommands,
-)
 from picard.webservice import WebService
 from picard.webservice.api_helpers import (
     AcoustIdAPIHelper,
@@ -183,44 +178,6 @@ _orig_shutil_copystat = shutil.copystat
 shutil.copystat = _patched_shutil_copystat
 
 
-class ParseItemsToLoad:
-
-    WINDOWS_DRIVE_TEST = re.compile(r"^[a-z]\:", re.IGNORECASE)
-
-    def __init__(self, items):
-        self.files = set()
-        self.mbids = set()
-        self.urls = set()
-
-        for item in items:
-            parsed = urlparse(item)
-            log.debug(f"Parsed: {repr(parsed)}")
-            if not parsed.scheme:
-                self.files.add(item)
-            if parsed.scheme == 'file':
-                # remove file:// prefix safely
-                self.files.add(item[7:])
-            elif parsed.scheme == 'mbid':
-                self.mbids.add(parsed.netloc + parsed.path)
-            elif parsed.scheme in {'http', 'https'}:
-                # .path returns / before actual link
-                self.urls.add(parsed.path[1:])
-            elif IS_WIN and self.WINDOWS_DRIVE_TEST.match(item):
-                # Treat all single-character schemes as part of the file spec to allow
-                # specifying a drive identifier on Windows systems.
-                self.files.add(item)
-
-    # needed to indicate whether Picard should be brought to the front
-    def non_executable_items(self):
-        return bool(self.files or self.mbids or self.urls)
-
-    def __bool__(self):
-        return bool(self.files or self.mbids or self.urls)
-
-    def __str__(self):
-        return f"files: {repr(self.files)}  mbids: f{repr(self.mbids)}  urls: {repr(self.urls)}"
-
-
 class Tagger(QtWidgets.QApplication):
 
     tagger_stats_changed = QtCore.pyqtSignal()
@@ -232,48 +189,72 @@ class Tagger(QtWidgets.QApplication):
 
     __instance = None
 
-    _debug = False
-    _no_restore = False
-
-    def __init__(self, picard_args, localedir, autoupdate, pipe_handler=None):
-        # Initialize these variables early as they are needed for a clean
-        # shutdown.
-        self._acoustid = None
-        self.browser_integration = None
-        self.exit_cleanup = []
-        self.pipe_handler = None
-        self.priority_thread_pool = None
-        self.save_thread_pool = None
-        self.stopping = False
-        self.thread_pool = None
-        self.webservice = None
-
+    def __init__(self, cmdline_args, localedir, autoupdate, pipe_handler=None):
+        self._bootstrap()
         super().__init__(sys.argv)
         self.__class__.__instance = self
+        self._init_properties_from_args_or_env(cmdline_args)
         init_options()
-        setup_config(app=self, filename=picard_args.config_file)
+        setup_config(app=self, filename=self._config_file)
         config = get_config()
-        theme.setup(self)
-
-        self._to_load = picard_args.processable
 
         self.autoupdate_enabled = autoupdate
-        self._no_restore = picard_args.no_restore
-        self._no_plugins = picard_args.no_plugins
 
-        self.set_log_level(config.setting['log_verbosity'])
+        self._init_logging(config)
+        self._init_threads()
+        self._init_pipe_server(pipe_handler)
+        self._init_remote_commands()
+        self._init_signal_handling()
 
-        if picard_args.debug or 'PICARD_DEBUG' in os.environ:
-            self.set_log_level(logging.DEBUG)
+        self._log_startup(config)
 
-        if picard_args.audit:
-            setup_audit(picard_args.audit)
+        theme.setup(self)
+        check_io_encoding()
 
-        if picard_args.debug_opts:
-            DebugOpt.from_string(picard_args.debug_opts)
+        self._init_gettext(config, localedir)
 
+        upgrade_config(config)
+
+        self._init_webservice()
+        self._init_fingerprinting()
+        self._init_plugins()
+        self._init_browser_integration()
+        self._init_tagger_entities()
+
+        self._init_ui(config)
+
+    def _bootstrap(self):
+        """Bootstraping"""
+        # Initialize these variables early as they are needed for a clean
+        # shutdown.
+        self.exit_cleanup = []
+        self.stopping = False
+
+    def _init_properties_from_args_or_env(self, cmdline_args):
+        """Initialize properties from command line arguments or environment"""
+        self._audit = cmdline_args.audit
+        self._config_file = cmdline_args.config_file
+        self._debug_opts = cmdline_args.debug_opts
+        self._debug = cmdline_args.debug or 'PICARD_DEBUG' in os.environ
+        self._no_player = cmdline_args.no_player
+        self._no_plugins = cmdline_args.no_plugins
+        self._no_restore = cmdline_args.no_restore
+        self._to_load = cmdline_args.processable
+
+    def _init_logging(self, config):
+        """Initialize logging & audit"""
+        log.set_verbosity(logging.DEBUG if self._debug else config.setting['log_verbosity'])
+
+        setup_audit(self._audit)
+
+        if self._debug_opts:
+            DebugOpt.from_string(self._debug_opts)
+
+    def _init_threads(self):
+        """Initialize threads"""
         # Main thread pool used for most background tasks
         self.thread_pool = QtCore.QThreadPool(self)
+        self.register_cleanup(self.thread_pool.waitForDone)
         # Two threads are needed for the pipe handler and command processing.
         # At least one thread is required to run other Picard background tasks.
         self.thread_pool.setMaxThreadCount(max(3, QtCore.QThread.idealThreadCount()))
@@ -283,47 +264,53 @@ class Tagger(QtWidgets.QApplication):
         # expects instant feedback instead of waiting for a long list of
         # operations to finish.
         self.priority_thread_pool = QtCore.QThreadPool(self)
+        self.register_cleanup(self.priority_thread_pool.waitForDone)
         self.priority_thread_pool.setMaxThreadCount(1)
 
         # Use a separate thread pool for file saving, with a thread count of 1,
         # to avoid race conditions in File._save_and_rename.
         self.save_thread_pool = QtCore.QThreadPool(self)
+        self.register_cleanup(self.save_thread_pool.waitForDone)
         self.save_thread_pool.setMaxThreadCount(1)
 
-        # Setup pipe handler for managing single app instance and commands.
+    def _init_pipe_server(self, pipe_handler):
+        """Setup pipe handler for managing single app instance and commands."""
         self.pipe_handler = pipe_handler
 
         if self.pipe_handler:
+            self.register_cleanup(self.pipe_handler.stop)
             self._command_thread_running = False
             self.pipe_handler.pipe_running = True
             thread.run_task(self.pipe_server, self._pipe_server_finished)
 
-        self._init_remote_commands()
+    def _init_signal_handling(self):
+        """Set up signal handling"""
+        if IS_WIN:
+            return
 
-        if not IS_WIN:
-            # Set up signal handling
-            # It's not possible to call all available functions from signal
-            # handlers, therefore we need to set up a QSocketNotifier to listen
-            # on a socket. Sending data through a socket can be done in a
-            # signal handler, so we use the socket to notify the application of
-            # the signal.
-            # This code is adopted from
-            # https://qt-project.org/doc/qt-4.8/unix-signals.html
+        # It's not possible to call all available functions from signal
+        # handlers, therefore we need to set up a QSocketNotifier to listen
+        # on a socket. Sending data through a socket can be done in a
+        # signal handler, so we use the socket to notify the application of
+        # the signal.
+        # This code is adopted from
+        # https://qt-project.org/doc/qt-4.8/unix-signals.html
 
-            # To not make the socket module a requirement for the Windows
-            # installer, import it here and not globally
-            import socket
-            self.signalfd = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM, 0)
+        # To not make the socket module a requirement for the Windows
+        # installer, import it here and not globally
+        import socket
+        self.signalfd = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM, 0)
 
-            self.signalnotifier = QtCore.QSocketNotifier(self.signalfd[1].fileno(),
-                                                         QtCore.QSocketNotifier.Type.Read, self)
-            self.signalnotifier.activated.connect(self.sighandler)
+        self.signalnotifier = QtCore.QSocketNotifier(self.signalfd[1].fileno(),
+                                                     QtCore.QSocketNotifier.Type.Read, self)
+        self.signalnotifier.activated.connect(self.sighandler)
 
-            signal.signal(signal.SIGHUP, self.signal)
-            signal.signal(signal.SIGINT, self.signal)
-            signal.signal(signal.SIGTERM, self.signal)
+        signal.signal(signal.SIGHUP, self.signal)
+        signal.signal(signal.SIGINT, self.signal)
+        signal.signal(signal.SIGTERM, self.signal)
 
-        # Setup logging
+    def _log_startup(self, config):
+        """Log interesting infos at startup"""
         log.debug("Starting Picard from %r", os.path.abspath(__file__))
         log.debug("Platform: %s %s %s", platform.platform(),
                   platform.python_implementation(), platform.python_version())
@@ -336,8 +323,8 @@ class Tagger(QtWidgets.QApplication):
         # log interesting environment variables
         log.debug("Qt Env.: %s", " ".join("%s=%r" % (k, v) for k, v in os.environ.items() if k.startswith('QT_')))
 
-        check_io_encoding()
-
+    def _init_gettext(self, config, localedir):
+        """Initialize gettext"""
         if not localedir:
             # Unfortunately we cannot use importlib.resources to access the data
             # files, as gettext expects a path to a directory for localedir.
@@ -346,30 +333,36 @@ class Tagger(QtWidgets.QApplication):
         # Must be before config upgrade because upgrade dialogs need to be translated.
         setup_gettext(localedir, config.setting['ui_language'], log.debug)
 
-        upgrade_config(config)
-
+    def _init_webservice(self):
+        """Initialize web service/API"""
         self.webservice = WebService()
+        self.register_cleanup(self.webservice.stop)
         self.mb_api = MBAPIHelper(self.webservice)
-
         load_user_collections()
 
-        # Initialize fingerprinting
+    def _init_fingerprinting(self):
+        """Initialize fingerprinting"""
         acoustid_api = AcoustIdAPIHelper(self.webservice)
         self._acoustid = acoustid.AcoustIDClient(acoustid_api)
         self._acoustid.init()
+        self.register_cleanup(self._acoustid.done)
         self.acoustidmanager = AcoustIDManager(acoustid_api)
 
-        self.enable_menu_icons(config.setting['show_menu_icons'])
-
-        # Load plugins
+    def _init_plugins(self):
+        """Initialize and load plugins"""
         self.pluginmanager = PluginManager()
         if not self._no_plugins:
             for plugin_dir in plugin_dirs():
                 self.pluginmanager.load_plugins_from_directory(plugin_dir)
 
+    def _init_browser_integration(self):
+        """Initialize browser integration"""
         self.browser_integration = BrowserIntegration()
+        self.register_cleanup(self.browser_integration.stop)
         self.browser_integration.listen_port_changed.connect(self.on_listen_port_changed)
 
+    def _init_tagger_entities(self):
+        """Initialize tagger objects/entities"""
         self._pending_files_count = 0
         self.files = {}
         self.clusters = ClusterList()
@@ -378,7 +371,11 @@ class Tagger(QtWidgets.QApplication):
         self.mbid_redirects = {}
         self.unclustered_files = UnclusteredFiles()
         self.nats = None
-        self.window = MainWindow(disable_player=picard_args.no_player)
+
+    def _init_ui(self, config):
+        """Initialize User Interface / Main Window"""
+        self.enable_menu_icons(config.setting['show_menu_icons'])
+        self.window = MainWindow(disable_player=self._no_player)
 
         # On macOS temporary files get deleted after 3 days not being accessed.
         # Touch these files regularly to keep them alive if Picard
@@ -491,149 +488,7 @@ class Tagger(QtWidgets.QApplication):
         yield from self.clusters.iterfiles()
 
     def _init_remote_commands(self):
-        self.commands = {name: getattr(self, remcmd.method_name) for name, remcmd in REMOTE_COMMANDS.items()}
-
-    def handle_command_clear_logs(self, argstring):
-        self.window.log_dialog.clear()
-        self.window.history_dialog.clear()
-
-    def handle_command_cluster(self, argstring):
-        self.cluster(self.unclustered_files.files)
-
-    def handle_command_fingerprint(self, argstring):
-        for album_name in self.albums:
-            self.analyze(self.albums[album_name].iterfiles())
-
-    def handle_command_from_file(self, argstring):
-        RemoteCommands.get_commands_from_file(argstring)
-
-    def handle_command_load(self, argstring):
-        parsed_items = ParseItemsToLoad([argstring])
-        log.debug(str(parsed_items))
-
-        if parsed_items.files:
-            self.add_paths(parsed_items.files)
-
-        if parsed_items.urls or parsed_items.mbids:
-            file_lookup = self.get_file_lookup()
-            for item in parsed_items.mbids | parsed_items.urls:
-                file_lookup.mbid_lookup(item)
-
-    def handle_command_lookup(self, argstring):
-        if argstring:
-            argstring = argstring.upper()
-        if not argstring or argstring == 'ALL':
-            self.autotag(self.clusters)
-            self.autotag(self.unclustered_files.files)
-        elif argstring == 'CLUSTERED':
-            self.autotag(self.clusters)
-        elif argstring == 'UNCLUSTERED':
-            self.autotag(self.unclustered_files.files)
-        else:
-            log.error("Invalid LOOKUP command argument: '%s'", argstring)
-
-    def handle_command_lookup_cd(self, argstring):
-        if not _discid:
-            log.error(DISCID_NOT_LOADED_MESSAGE)
-            return
-        disc = Disc()
-        devices = get_cdrom_drives()
-
-        if not argstring:
-            if devices:
-                device = devices[0]
-            else:
-                device = None
-        elif argstring in devices:
-            device = argstring
-        else:
-            thread.run_task(
-                partial(self._parse_disc_ripping_log, disc, argstring),
-                partial(self._lookup_disc, disc),
-                traceback=self._debug)
-            return
-
-        thread.run_task(
-            partial(disc.read, encode_filename(device)),
-            partial(self._lookup_disc, disc),
-            traceback=self._debug)
-
-    def handle_command_pause(self, argstring):
-        arg = argstring.strip()
-        if arg:
-            try:
-                delay = float(arg)
-                if delay < 0:
-                    raise ValueError
-                log.debug("Pausing command execution by %d seconds.", delay)
-                thread.run_task(partial(time.sleep, delay))
-            except ValueError:
-                log.error(f"Invalid command pause time specified: {repr(argstring)}")
-        else:
-            log.error("No command pause time specified.")
-
-    def handle_command_quit(self, argstring):
-        if argstring.upper() == 'FORCE' or self.window.show_quit_confirmation():
-            self.quit()
-        else:
-            log.info("QUIT command cancelled by the user.")
-            RemoteCommands.set_quit(False)  # Allow queueing more commands.
-            return
-
-    def handle_command_remove(self, argstring):
-        for file in self.iter_all_files():
-            if file.filename == argstring:
-                self.remove([file])
-                return
-
-    def handle_command_remove_all(self, argstring):
-        for file in self.iter_all_files():
-            self.remove([file])
-
-    def handle_command_remove_empty(self, argstring):
-        _albums = [a for a in self.albums.values()]
-        for album in _albums:
-            if not any(album.iterfiles()):
-                self.remove_album(album)
-
-        for cluster in self.clusters:
-            if not any(cluster.iterfiles()):
-                self.remove_cluster(cluster)
-
-    def handle_command_remove_saved(self, argstring):
-        for track in self.iter_album_files():
-            if track.state == File.NORMAL:
-                self.remove([track])
-
-    def handle_command_remove_unclustered(self, argstring):
-        self.remove(self.unclustered_files.files)
-
-    def handle_command_save_matched(self, argstring):
-        for album in self.albums.values():
-            for track in album.iter_correctly_matched_tracks():
-                track.files[0].save()
-
-    def handle_command_save_modified(self, argstring):
-        for track in self.iter_album_files():
-            if track.state == File.CHANGED:
-                track.save()
-
-    def handle_command_scan(self, argstring):
-        self.analyze(self.unclustered_files.files)
-
-    def handle_command_show(self, argstring):
-        self.bring_tagger_front()
-
-    def handle_command_submit_fingerprints(self, argstring):
-        self.acoustidmanager.submit()
-
-    def handle_command_write_logs(self, argstring):
-        try:
-            with open(argstring, 'w', encoding='utf-8') as f:
-                for x in self.window.log_dialog.log_tail.contents():
-                    f.write(f"{x.message}\n")
-        except Exception as e:
-            log.error("Error writing logs to a file: %s", e)
+        self.commands = RemoteCommands.commands()
 
     def enable_menu_icons(self, enabled):
         self.setAttribute(QtCore.Qt.ApplicationAttribute.AA_DontShowIconsInMenus, not enabled)
@@ -642,12 +497,8 @@ class Tagger(QtWidgets.QApplication):
         self.exit_cleanup.append(func)
 
     def run_cleanup(self):
-        for f in self.exit_cleanup:
+        for f in reversed(self.exit_cleanup):
             f()
-
-    def set_log_level(self, level):
-        self._debug = level == logging.DEBUG
-        log.set_level(level)
 
     def on_listen_port_changed(self, port):
         self.webservice.oauth_manager.redirect_uri = self._mb_login_redirect_uri()
@@ -668,7 +519,7 @@ class Tagger(QtWidgets.QApplication):
 
     def _mb_login_redirect_uri(self):
         if self.browser_integration and self.browser_integration.is_running:
-            return f'http://localhost:{self.browser_integration.port}/auth'
+            return f'http://{BROWSER_INTEGRATION_LOCALHOST}:{self.browser_integration.port}/auth'
         else:
             # If browser integration is disabled or not running on the standard
             # port use out-of-band flow (with manual copying of the token).
@@ -752,20 +603,6 @@ class Tagger(QtWidgets.QApplication):
             return
         self.stopping = True
         log.debug("Picard stopping")
-        if self._acoustid:
-            self._acoustid.done()
-        if self.pipe_handler:
-            self.pipe_handler.stop()
-        if self.webservice:
-            self.webservice.stop()
-        if self.thread_pool:
-            self.thread_pool.waitForDone()
-        if self.save_thread_pool:
-            self.save_thread_pool.waitForDone()
-        if self.priority_thread_pool:
-            self.priority_thread_pool.waitForDone()
-        if self.browser_integration:
-            self.browser_integration.stop()
         self.run_cleanup()
         QtCore.QCoreApplication.processEvents()
 
@@ -1200,12 +1037,15 @@ class Tagger(QtWidgets.QApplication):
             # rely on python-discid auto detection
             device = None
 
+        self.run_lookup_cd(device)
+
+    def run_lookup_cd(self, device):
         disc = Disc()
         self.set_wait_cursor()
         thread.run_task(
             partial(disc.read, encode_filename(device)),
             partial(self._lookup_disc, disc),
-            traceback=self._debug)
+            traceback=log.is_debug())
 
     def lookup_discid_from_logfile(self):
         file_chooser = FileDialog(parent=self.window)
@@ -1216,13 +1056,17 @@ class Tagger(QtWidgets.QApplication):
             _("All files") + " (*)",
         ])
         if file_chooser.exec():
-            files = file_chooser.selectedFiles()
-            disc = Disc()
-            self.set_wait_cursor()
-            thread.run_task(
-                partial(self._parse_disc_ripping_log, disc, files[0]),
-                partial(self._lookup_disc, disc),
-                traceback=self._debug)
+            filepath = file_chooser.selectedFiles()[0]
+            self.run_lookup_discid_from_logfile(filepath)
+
+    def run_lookup_discid_from_logfile(self, filepath):
+        disc = Disc()
+        self.set_wait_cursor()
+        thread.run_task(
+            partial(self._parse_disc_ripping_log, disc, filepath),
+            partial(self._lookup_disc, disc),
+            traceback=log.is_debug(),
+        )
 
     def _parse_disc_ripping_log(self, disc, path):
         log_readers = (
@@ -1286,7 +1130,7 @@ class Tagger(QtWidgets.QApplication):
     def cluster(self, objs, callback=None):
         """Group files with similar metadata to 'clusters'."""
         files = tuple(iter_files_from_objects(objs))
-        if log.get_effective_level() == logging.DEBUG:
+        if log.is_debug():
             limit = 5
             count = len(files)
             remain = max(0, count - limit)
@@ -1369,7 +1213,7 @@ class Tagger(QtWidgets.QApplication):
         self.signalnotifier.setEnabled(True)
 
 
-class PicardArgumentParser(argparse.ArgumentParser):
+class CmdlineArgsParser(argparse.ArgumentParser):
     def exit(self, status=0, message=None):
         if is_windowed_app():
             if message:
@@ -1433,40 +1277,13 @@ def print_message_and_exit(message, informative_text=None, status=0):
 
 
 def print_help_for_commands():
-    if is_windowed_app():
-        maxwidth = 300
-    else:
-        maxwidth = 80
-    informative_text = []
-
-    message = """Usage: picard -e [command] [arguments ...]
-    or picard -e [command 1] [arguments ...] -e [command 2] [arguments ...]
-
-List of the commands available to execute in Picard from the command-line:
-"""
-
-    for name in sorted(REMOTE_COMMANDS):
-        remcmd = REMOTE_COMMANDS[name]
-        s = "  - %-34s %s" % (name + " " + remcmd.help_args, remcmd.help_text)
-        informative_text.append(fill(s, width=maxwidth, subsequent_indent=' '*39))
-
-    informative_text.append('')
-
-    def fmt(s):
-        informative_text.append(fill(s, width=maxwidth))
-
-    fmt("Commands are case insensitive.")
-    fmt("Picard will try to load all the positional arguments before processing commands.")
-    fmt("If there is no instance to pass the arguments to, Picard will start and process the commands after the "
-        "positional arguments are loaded, as mentioned above. Otherwise they will be handled by the running "
-        "Picard instance")
-    fmt("Arguments are optional, but some commands may require one or more arguments to actually do something.")
-
-    print_message_and_exit(message, "\n".join(informative_text))
+    maxwidth = 300 if is_windowed_app() else 80
+    message, informative_text = RemoteCommands.help(maxwidth)
+    print_message_and_exit(message, informative_text)
 
 
-def process_picard_args():
-    parser = PicardArgumentParser(
+def process_cmdline_args():
+    parser = CmdlineArgsParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""If one of the filenames begins with a hyphen, use -- to separate the options from the filenames.
 If a new instance will not be spawned files/directories will be passed to the existing instance"""
@@ -1537,7 +1354,40 @@ If a new instance will not be spawned files/directories will be passed to the ex
     return args
 
 
-def main(localedir=None, autoupdate=True):
+PipeStatus = namedtuple('PipeStatus', ('handler', 'is_remote'))
+
+
+def setup_pipe_handler(cmdline_args):
+    """Setup pipe handler, identify if the app is running as standalone or remote instance"""
+    # any of the flags that change Picard's workflow significantly should trigger creation of a new instance
+    if cmdline_args.stand_alone_instance:
+        identifier = uuid4().hex
+    else:
+        if cmdline_args.config_file:
+            identifier = blake2b(cmdline_args.config_file.encode('utf-8'), digest_size=16).hexdigest()
+        else:
+            identifier = 'main'
+        if cmdline_args.no_plugins:
+            identifier += '_NP'
+
+    try:
+        pipe_handler = pipe.Pipe(
+            app_name=PICARD_APP_NAME,
+            app_version=PICARD_FANCY_VERSION_STR,
+            identifier=identifier,
+            args=cmdline_args.processable
+        )
+        is_remote = not pipe_handler.is_pipe_owner
+    except pipe.PipeErrorNoPermission as err:
+        log.error(err)
+        pipe_handler = None
+        is_remote = False
+
+    return PipeStatus(handler=pipe_handler, is_remote=is_remote)
+
+
+def setup_application():
+    """Setup QApplication"""
     # Some libs (ie. Phonon) require those to be set
     QtWidgets.QApplication.setApplicationName(PICARD_APP_NAME)
     QtWidgets.QApplication.setOrganizationName(PICARD_ORG_NAME)
@@ -1553,46 +1403,9 @@ def main(localedir=None, autoupdate=True):
     # Enable mnemonics on all platforms, even macOS
     QtGui.qt_set_sequence_auto_mnemonic(True)
 
-    signal.signal(signal.SIGINT, signal.SIG_DFL)
 
-    picard_args = process_picard_args()
-
-    if picard_args.long_version:
-        _ = QtCore.QCoreApplication(sys.argv)
-        print_message_and_exit(versions.as_string())
-    if picard_args.version:
-        print_message_and_exit(f"{PICARD_ORG_NAME} {PICARD_APP_NAME} {PICARD_FANCY_VERSION_STR}")
-    if picard_args.remote_commands_help:
-        print_help_for_commands()
-
-    # any of the flags that change Picard's workflow significantly should trigger creation of a new instance
-    if picard_args.stand_alone_instance:
-        identifier = uuid4().hex
-    else:
-        if picard_args.config_file:
-            identifier = blake2b(picard_args.config_file.encode('utf-8'), digest_size=16).hexdigest()
-        else:
-            identifier = 'main'
-        if picard_args.no_plugins:
-            identifier += '_NP'
-
-    if picard_args.processable:
-        log.info("Sending messages to main instance: %r", picard_args.processable)
-
-    try:
-        pipe_handler = pipe.Pipe(app_name=PICARD_APP_NAME, app_version=PICARD_FANCY_VERSION_STR,
-                                    identifier=identifier, args=picard_args.processable)
-        should_start = pipe_handler.is_pipe_owner
-    except pipe.PipeErrorNoPermission as err:
-        log.error(err)
-        pipe_handler = None
-        should_start = True
-
-    # pipe has sent its args to existing one, doesn't need to start
-    if not should_start:
-        log.debug("No need for spawning a new instance, exiting...")
-        sys.exit(0)
-
+def setup_dbus():
+    """Setup DBus if available"""
     try:
         from PyQt6.QtDBus import QDBusConnection
         dbus = QDBusConnection.sessionBus()
@@ -1600,9 +1413,9 @@ def main(localedir=None, autoupdate=True):
     except ImportError:
         pass
 
-    tagger = Tagger(picard_args, localedir, autoupdate, pipe_handler=pipe_handler)
 
-    # Initialize Qt default translations
+def setup_translator(tagger):
+    """Setup Qt default translations"""
     translator = QtCore.QTranslator()
     locale = QtCore.QLocale()
     translation_path = QtCore.QLibraryInfo.path(QtCore.QLibraryInfo.LibraryPath.TranslationsPath)
@@ -1611,6 +1424,38 @@ def main(localedir=None, autoupdate=True):
         tagger.installTranslator(translator)
     else:
         log.debug("Qt locale %s not available", locale.name())
+
+
+def main(localedir=None, autoupdate=True):
+    """Main entry point to the program"""
+    setup_application()
+
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+    cmdline_args = process_cmdline_args()
+
+    if cmdline_args.long_version:
+        _ = QtCore.QCoreApplication(sys.argv)
+        print_message_and_exit(versions.as_string())
+    if cmdline_args.version:
+        print_message_and_exit(f"{PICARD_ORG_NAME} {PICARD_APP_NAME} {PICARD_FANCY_VERSION_STR}")
+    if cmdline_args.remote_commands_help:
+        print_help_for_commands()
+    if cmdline_args.processable:
+        log.info("Sending messages to main instance: %r", cmdline_args.processable)
+
+    pipe_status = setup_pipe_handler(cmdline_args)
+
+    # pipe has sent its args to existing one, doesn't need to start
+    if pipe_status.is_remote:
+        log.debug("No need for spawning a new instance, exiting...")
+        sys.exit(0)
+
+    setup_dbus()
+
+    tagger = Tagger(cmdline_args, localedir, autoupdate, pipe_handler=pipe_status.handler)
+
+    setup_translator(tagger)
 
     tagger.startTimer(1000)
     exit_code = tagger.run()
