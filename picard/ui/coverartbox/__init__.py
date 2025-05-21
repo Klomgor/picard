@@ -266,6 +266,7 @@ class CoverArtBox(QtWidgets.QGroupBox):
 
     def choose_local_file(self):
         file_chooser = FileDialog(parent=self)
+        file_chooser.setFileMode(QtWidgets.QFileDialog.FileMode.ExistingFiles)
         extensions = ['*' + ext for ext in imageinfo.get_supported_extensions()]
         extensions.sort()
         file_chooser.setNameFilters([
@@ -274,8 +275,8 @@ class CoverArtBox(QtWidgets.QGroupBox):
         ])
         if file_chooser.exec():
             file_urls = file_chooser.selectedUrls()
-            if file_urls:
-                self.fetch_remote_image(file_urls[0])
+            for url in file_urls:
+                self.fetch_remote_image(url)
 
     def choose_image_from_url(self):
         url, ok = ImageURLDialog.display(parent=self)

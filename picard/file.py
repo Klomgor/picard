@@ -81,6 +81,12 @@ from picard.metadata import (
 )
 from picard.plugin import PluginFunctions
 from picard.script import get_file_naming_script
+from picard.tags import (
+    calculated_tag_names,
+    file_info_tag_names,
+    preserved_tag_names,
+)
+from picard.tags.preserved import UserPreservedTags
 from picard.util import (
     any_exception_isinstance,
     bytes2human,
@@ -100,13 +106,7 @@ from picard.util.filenaming import (
     make_short_filename,
     move_ensure_casing,
 )
-from picard.util.preservedtags import PreservedTags
 from picard.util.scripttofilename import script_to_filename_with_metadata
-from picard.util.tags import (
-    CALCULATED_TAGS,
-    FILE_INFO_TAGS,
-    PRESERVED_TAGS,
-)
 
 
 FILE_COMPARISON_WEIGHTS = {
@@ -300,21 +300,22 @@ class File(MetadataItem):
                 metadata[m] = getattr(guessed, m)
 
     def _copy_file_info_tags(self, to_metadata, from_metadata):
-        for tag in FILE_INFO_TAGS:
+        for tag in file_info_tag_names():
             to_metadata[tag] = from_metadata[tag]
 
     def copy_metadata(self, metadata, preserve_deleted=True):
         saved_metadata = {}
 
         # Keep current value for special tags that got calculated from audio content
-        for tag in CALCULATED_TAGS:
+        for tag in calculated_tag_names():
             if tag not in metadata.deleted_tags and self.metadata[tag]:
                 saved_metadata[tag] = self.metadata[tag]
 
         # Keep original values of preserved tags
-        preserved_tags = PreservedTags()
+        preserved_tags = UserPreservedTags()
+        default_preserved_tags = set(preserved_tag_names())
         for tag, values in self.orig_metadata.rawitems():
-            if tag in preserved_tags or tag in PRESERVED_TAGS:
+            if tag in preserved_tags or tag in default_preserved_tags:
                 saved_metadata[tag] = values
         deleted_tags = self.metadata.deleted_tags
         images_changed = self.metadata.images != metadata.images
