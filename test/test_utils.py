@@ -298,21 +298,6 @@ class HiddenFileTest(PicardTestCase):
             self.assertTrue(util.is_hidden(f.name), "%s expected to be hidden" % f.name)
 
 
-class TagsTest(PicardTestCase):
-
-    def test_display_tag_name(self):
-        dtn = util.tags.display_tag_name
-        self.assertEqual(dtn('tag'), 'tag')
-        self.assertEqual(dtn('tag:desc'), 'tag [desc]')
-        self.assertEqual(dtn('tag:'), 'tag')
-        self.assertEqual(dtn('tag:de:sc'), 'tag [de:sc]')
-        self.assertEqual(dtn('originalyear'), 'Original Year')
-        self.assertEqual(dtn('originalyear:desc'), 'Original Year [desc]')
-        self.assertEqual(dtn('~length'), 'Length')
-        self.assertEqual(dtn('~lengthx'), '~lengthx')
-        self.assertEqual(dtn(''), '')
-
-
 class LinearCombinationTest(PicardTestCase):
 
     def test_0(self):
@@ -641,6 +626,8 @@ class TracknumAndTitleFromFilenameTest(PicardTestCase):
             (('99', 'Foo'), '99 Foo.mp3'),
             (('42', 'Foo'), '0000042 Foo.mp3'),
             (('2', 'Foo'), '0000002 Foo.mp3'),
+            # Tracknumber dot not in title
+            (('77', 'Foo'), '77. Foo.mp3'),
             ((None, '20000 Feet'), '20000 Feet.mp3'),
             ((None, '20,000 Feet'), '20,000 Feet.mp3'),
             ((None, 'Venus (Original 12" version)'), 'Venus (Original 12" version).mp3'),
