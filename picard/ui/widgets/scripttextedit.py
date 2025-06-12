@@ -6,7 +6,7 @@
 # Copyright (C) 2014 m42i
 # Copyright (C) 2020-2024 Laurent Monin
 # Copyright (C) 2020-2024 Philipp Wolfer
-# Copyright (C) 2021-2022 Bob Swift
+# Copyright (C) 2021-2022, 2025 Bob Swift
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -52,11 +52,9 @@ from picard.script import (
     script_function_documentation,
     script_function_names,
 )
-from picard.util.tags import (
-    EXTRA_VARIABLES,
-    PRESERVED_TAGS,
-    TAG_NAMES,
-    display_tag_name,
+from picard.tags import (
+    display_tag_tooltip,
+    script_variable_tag_names,
 )
 
 from picard.ui import FONT_FAMILY_MONOSPACE
@@ -176,21 +174,14 @@ class TaggerScriptSyntaxHighlighter(QtGui.QSyntaxHighlighter):
 
 class ScriptCompleter(QCompleter):
     def __init__(self, parent=None):
-        super().__init__(sorted(self.choices), parent)
-        self.setCompletionMode(QCompleter.CompletionMode.UnfilteredPopupCompletion)
-        self.highlighted.connect(self.set_highlighted)
+        super().__init__(self.choices, parent)
         self.last_selected = ''
+        self.highlighted.connect(self.set_highlighted)
 
     @property
     def choices(self):
-        yield from {'$' + name for name in script_function_names()}
-        yield from {'%' + name.replace('~', '_') + '%' for name in self.all_tags}
-
-    @property
-    def all_tags(self):
-        yield from TAG_NAMES.keys()
-        yield from PRESERVED_TAGS
-        yield from EXTRA_VARIABLES
+        yield from sorted(f'${name}' for name in script_function_names())
+        yield from sorted(f'%{name}%' for name in script_variable_tag_names())
 
     def set_highlighted(self, text):
         self.last_selected = text
@@ -271,7 +262,7 @@ class VariableScriptToken(DocumentedScriptToken):
         if self._doc.characterAt(position) != '%':
             return None
         tag = self._read_allowed_chars(position + 1)
-        return display_tag_name(tag)
+        return display_tag_tooltip(tag)
 
 
 class UnicodeEscapeScriptToken(DocumentedScriptToken):
@@ -320,7 +311,7 @@ class ScriptTextEdit(QTextEdit):
         super().__init__(parent)
         config = get_config()
         self.highlighter = TaggerScriptSyntaxHighlighter(self.document())
-        self.enable_completer()
+        self.initialize_completer()
         self.setFontFamily(FONT_FAMILY_MONOSPACE)
         self.setMouseTracking(True)
         self.setAcceptRichText(False)
@@ -422,7 +413,7 @@ class ScriptTextEdit(QTextEdit):
             QToolTip.hideText()
             self.setToolTip('')
 
-    def enable_completer(self):
+    def initialize_completer(self):
         self.completer = ScriptCompleter()
         self.completer.setWidget(self)
         self.completer.activated.connect(self.insert_completion)

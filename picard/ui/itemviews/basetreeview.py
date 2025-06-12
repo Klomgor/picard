@@ -89,95 +89,12 @@ from picard.util import (
 
 from picard.ui.collectionmenu import CollectionMenu
 from picard.ui.enums import MainAction
-from picard.ui.itemviews.columns import (
-    DEFAULT_COLUMNS,
-    ITEM_ICON_COLUMN,
-)
 from picard.ui.ratingwidget import RatingWidget
 from picard.ui.scriptsmenu import ScriptsMenu
 from picard.ui.util import menu_builder
-from picard.ui.widgets.tristatesortheaderview import TristateSortHeaderView
-
-
-DEFAULT_SECTION_SIZE = 100
-
-
-class ConfigurableColumnsHeader(TristateSortHeaderView):
-
-    def __init__(self, parent=None):
-        super().__init__(QtCore.Qt.Orientation.Horizontal, parent)
-        self._visible_columns = set([ITEM_ICON_COLUMN])
-
-        self.sortIndicatorChanged.connect(self.on_sort_indicator_changed)
-
-        # enable sorting, but don't actually use it by default
-        # XXX it would be nice to be able to go to the 'no sort' mode, but the
-        #     internal model that QTreeWidget uses doesn't support it
-        self.setSortIndicator(-1, QtCore.Qt.SortOrder.AscendingOrder)
-
-    def show_column(self, column, show):
-        if column == ITEM_ICON_COLUMN:
-            # The first column always visible
-            # Still execute following to ensure it is shown
-            show = True
-        self.parent().setColumnHidden(column, not show)
-        if show:
-            self._visible_columns.add(column)
-        else:
-            self._visible_columns.discard(column)
-
-    def contextMenuEvent(self, event):
-        menu = QtWidgets.QMenu(self)
-        parent = self.parent()
-
-        for i, column in enumerate(DEFAULT_COLUMNS):
-            if i == ITEM_ICON_COLUMN:
-                continue
-            action = QtGui.QAction(_(column.title), parent)
-            action.setCheckable(True)
-            action.setChecked(i in self._visible_columns)
-            action.setEnabled(not self.is_locked)
-            action.triggered.connect(partial(self.show_column, i))
-            menu.addAction(action)
-
-        menu.addSeparator()
-        restore_action = QtGui.QAction(_("Restore default columns"), parent)
-        restore_action.setEnabled(not self.is_locked)
-        restore_action.triggered.connect(self.restore_defaults)
-        menu.addAction(restore_action)
-
-        lock_action = QtGui.QAction(_("Lock columns"), parent)
-        lock_action.setCheckable(True)
-        lock_action.setChecked(self.is_locked)
-        lock_action.toggled.connect(self.lock)
-        menu.addAction(lock_action)
-
-        menu.exec(event.globalPos())
-        event.accept()
-
-    def restore_defaults(self):
-        self.parent().restore_default_columns()
-
-    def paintSection(self, painter, rect, index):
-        column = DEFAULT_COLUMNS[index]
-        if column.is_icon:
-            painter.save()
-            super().paintSection(painter, rect, index)
-            painter.restore()
-            column.paint_icon(painter, rect)
-        else:
-            super().paintSection(painter, rect, index)
-
-    def on_sort_indicator_changed(self, index, order):
-        if DEFAULT_COLUMNS[index].is_icon:
-            self.setSortIndicator(-1, QtCore.Qt.SortOrder.AscendingOrder)
-
-    def lock(self, is_locked):
-        super().lock(is_locked)
-
-    def __str__(self):
-        name = getattr(self.parent(), 'NAME', str(self.parent().__class__.__name__))
-        return f"{name}'s header"
+from picard.ui.widgets.configurablecolumnsheader import (
+    ConfigurableColumnsHeader,
+)
 
 
 def _alternative_versions(album):
@@ -248,8 +165,9 @@ def _add_other_versions(releases_menu, album, action_loading):
 
 class BaseTreeView(QtWidgets.QTreeWidget):
 
-    def __init__(self, window, parent=None):
+    def __init__(self, columns, window, parent=None):
         super().__init__(parent=parent)
+        self.columns = columns
         self.setAccessibleName(_(self.NAME))
         self.setAccessibleDescription(_(self.DESCRIPTION))
         self.tagger = QtCore.QCoreApplication.instance()
@@ -446,8 +364,6 @@ class BaseTreeView(QtWidgets.QTreeWidget):
     @restore_method
     def restore_state(self):
         config = get_config()
-        self.restore_default_columns()
-
         header_state = config.persist[self.header_state]
         header = self.header()
         if header_state and header.restoreState(header_state):
@@ -469,28 +385,29 @@ class BaseTreeView(QtWidgets.QTreeWidget):
         config.persist[self.header_locked] = header.is_locked
 
     def restore_default_columns(self):
-        labels = [_(c.title) if not c.is_icon else '' for c in DEFAULT_COLUMNS]
+        labels = tuple(_(c.title) for c in self.columns)
         self.setHeaderLabels(labels)
 
         header = self.header()
         header.setStretchLastSection(True)
         header.setDefaultAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter)
-        header.setDefaultSectionSize(DEFAULT_SECTION_SIZE)
+        header.setDefaultSectionSize(self.columns.default_width)
 
-        for i, c in enumerate(DEFAULT_COLUMNS):
+        for i, c in enumerate(self.columns):
             header.show_column(i, c.is_default)
-            if c.is_icon:
-                header.resizeSection(i, c.header_icon_size_with_border.width())
-                header.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeMode.Fixed)
-            else:
-                header.resizeSection(i, c.size if c.size is not None else DEFAULT_SECTION_SIZE)
+            if c.width is not None:
+                header.resizeSection(i, c.width)
+            if c.resizeable:
                 header.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeMode.Interactive)
+            else:
+                header.setSectionResizeMode(i, QtWidgets.QHeaderView.ResizeMode.Fixed)
 
         self.sortByColumn(-1, QtCore.Qt.SortOrder.AscendingOrder)
 
     def _init_header(self):
-        header = ConfigurableColumnsHeader(self)
+        header = ConfigurableColumnsHeader(self.columns, parent=self)
         self.setHeader(header)
+        self.restore_default_columns()
         self.restore_state()
 
     def supportedDropActions(self):

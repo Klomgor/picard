@@ -53,13 +53,13 @@ from picard.mbjson import (
 )
 from picard.plugin import PluginFunctions
 from picard.similarity import similarity2
+from picard.tags import preserved_tag_names
 from picard.util import (
     ReadWriteLockContext,
     extract_year_from_date,
     linear_combination_of_weights,
 )
 from picard.util.imagelist import ImageList
-from picard.util.tags import PRESERVED_TAGS
 
 
 MULTI_VALUED_JOINER = '; '
@@ -561,8 +561,9 @@ class Metadata(MutableMapping):
 
     def apply_func(self, func):
         with self._lock.lock_for_write():
+            default_preserved_tags = set(preserved_tag_names())
             for name, values in list(self.rawitems()):
-                if name not in PRESERVED_TAGS:
+                if name not in default_preserved_tags:
                     self._set(name, (func(value) for value in values))
 
     def strip_whitespace(self):
