@@ -21,10 +21,14 @@
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
 
+from operator import attrgetter
 
 from picard.config import get_config
 from picard.file import FILE_COMPARISON_WEIGHTS
-from picard.i18n import gettext as _
+from picard.i18n import (
+    N_,
+    gettext as _,
+)
 from picard.mbjson import (
     countries_from_node,
     recording_to_metadata,
@@ -39,6 +43,12 @@ from picard.util import (
 )
 from picard.webservice.api_helpers import build_lucene_query
 
+from picard.ui.columns import (
+    Column,
+    ColumnAlign,
+    Columns,
+    ColumnSortType,
+)
 from picard.ui.searchdialog import (
     Retry,
     SearchDialog,
@@ -50,23 +60,24 @@ class TrackSearchDialog(SearchDialog):
     dialog_header_state = 'tracksearchdialog_header_state'
 
     def __init__(self, parent, force_advanced_search=None):
+        self.columns = Columns((
+            Column(N_("Name"), 'title', width=150),
+            Column(N_("Comment"), '~recordingcomment'),
+            Column(N_("Length"), '~length', sort_type=ColumnSortType.SORTKEY, sortkey=attrgetter('length'), align=ColumnAlign.RIGHT, width=50),
+            Column(N_("Artist"), 'artist'),
+            Column(N_("Release"), 'album'),
+            Column(N_("Date"), 'date'),
+            Column(N_("Country"), 'country'),
+            Column(N_("Type"), 'releasetype'),
+            Column(N_("Score"), 'score', sort_type=ColumnSortType.NAT, align=ColumnAlign.RIGHT, width=50),
+        ), default_width=100)
         super().__init__(
             parent,
-            accept_button_title=_("Load into Picard"),
+            N_("Track Search Results"),
+            accept_button_title=N_("Load into Picard"),
             search_type='track',
             force_advanced_search=force_advanced_search)
         self.file_ = None
-        self.setWindowTitle(_("Track Search Results"))
-        self.columns = [
-            ('name',    _("Name")),
-            ('length',  _("Length")),
-            ('artist',  _("Artist")),
-            ('release', _("Release")),
-            ('date',    _("Date")),
-            ('country', _("Country")),
-            ('type',    _("Type")),
-            ('score',   _("Score")),
-        ]
 
     def search(self, text):
         """Perform search using query provided by the user."""
@@ -134,14 +145,8 @@ class TrackSearchDialog(SearchDialog):
         for row, obj in enumerate(self.search_results):
             track = obj[0]
             self.table.insertRow(row)
-            self.set_table_item(row, 'name',    track, 'title')
-            self.set_table_item(row, 'length',  track, '~length', sortkey=track.length)
-            self.set_table_item(row, 'artist',  track, 'artist')
-            self.set_table_item(row, 'release', track, 'album')
-            self.set_table_item(row, 'date',    track, 'date')
-            self.set_table_item(row, 'country', track, 'country')
-            self.set_table_item(row, 'type',    track, 'releasetype')
-            self.set_table_item(row, 'score',   track, 'score')
+            for pos, c in enumerate(self.columns):
+                self.set_table_item_value(row, pos, c, track)
         self.show_table(sort_column='score')
 
     def parse_tracks(self, tracks):
@@ -151,6 +156,7 @@ class TrackSearchDialog(SearchDialog):
                     track = Metadata()
                     recording_to_metadata(node, track)
                     track['score'] = node['score']
+                    track['~recordingcomment'] = node.get('disambiguation', '')
                     release_to_metadata(rel_node, track)
                     rg_node = rel_node['release-group']
                     release_group_to_metadata(rg_node, track)
@@ -165,6 +171,7 @@ class TrackSearchDialog(SearchDialog):
                 recording_to_metadata(node, track)
                 track['score'] = node['score']
                 track["album"] = _("Standalone Recording")
+                track['~recordingcomment'] = node.get('disambiguation', '')
                 self.search_results.append((track, node))
 
     def accept_event(self, rows):

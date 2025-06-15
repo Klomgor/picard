@@ -44,15 +44,17 @@ from picard.const import (
     USER_PLUGIN_DIR,
 )
 from picard.const.sys import IS_FROZEN
+from picard.extension_points import (
+    PLUGIN_MODULE_PREFIX,
+    unregister_module_extensions,
+)
 from picard.i18n import (
     N_,
     gettext as _,
 )
 from picard.plugin import (
-    _PLUGIN_MODULE_PREFIX,
     PluginData,
     PluginWrapper,
-    _unregister_module_extensions,
 )
 import picard.plugins
 from picard.version import (
@@ -295,29 +297,23 @@ class PluginManager(QtCore.QObject):
         module_pathname = None
         zip_importer = None
         manifest_data = None
-        full_module_name = _PLUGIN_MODULE_PREFIX + name
+        full_module_name = PLUGIN_MODULE_PREFIX + name
         plugin_dir = None
 
-        # Legacy loading of ZIP plugins. In Python >= 3.10 this is all handled
-        # by PluginMetaPathFinder. Remove once Python 3.9 is no longer supported.
-        if not hasattr(zipimport.zipimporter, 'find_spec'):
-            (zip_importer, plugin_dir, module_pathname, manifest_data) = self._legacy_load_zip_plugin(name)
+        spec = PluginMetaPathFinder().find_spec(full_module_name, [])
+        if not spec or not spec.loader:
+            errorfmt = _('Failed loading plugin "%(plugin)s"')
+            self.plugin_error(name, errorfmt, params={
+                'plugin': name,
+            })
+            return None
 
-        if not module_pathname:
-            spec = PluginMetaPathFinder().find_spec(full_module_name, [])
-            if not spec or not spec.loader:
-                errorfmt = _('Failed loading plugin "%(plugin)s"')
-                self.plugin_error(name, errorfmt, params={
-                    'plugin': name,
-                })
-                return None
-
-            module_pathname = spec.origin
-            if isinstance(spec.loader, zipimport.zipimporter):
-                manifest_data = load_zip_manifest(spec.loader.archive)
-            if os.path.basename(module_pathname) == '__init__.py':
-                module_pathname = os.path.dirname(module_pathname)
-            plugin_dir = plugin_dir_for_path(module_pathname)
+        module_pathname = spec.origin
+        if isinstance(spec.loader, zipimport.zipimporter):
+            manifest_data = load_zip_manifest(spec.loader.archive)
+        if os.path.basename(module_pathname) == '__init__.py':
+            module_pathname = os.path.dirname(module_pathname)
+        plugin_dir = plugin_dir_for_path(module_pathname)
 
         plugin = None
         try:
@@ -369,23 +365,6 @@ class PluginManager(QtCore.QObject):
                               params={'plugin': name})
         return plugin
 
-    def _legacy_load_zip_plugin(self, name):
-        for plugin_dir in plugin_dirs():
-            zipfilename = os.path.join(plugin_dir, name + '.zip')
-            zip_importer = zip_import(zipfilename)
-            if zip_importer:
-                if not zip_importer.find_module(name):
-                    errorfmt = _('Failed loading zipped plugin "%(plugin)s" from "%(filename)s"')
-                    self.plugin_error(name, errorfmt, params={
-                        'plugin': name,
-                        'filename': zipfilename,
-                    })
-                    return (None, None, None, None)
-                module_pathname = zip_importer.get_filename(name)
-                manifest_data = load_zip_manifest(zip_importer.archive)
-                return (zip_importer, plugin_dir, module_pathname, manifest_data)
-        return (None, None, None, None)
-
     def _get_existing_paths(self, plugin_name, fileexts):
         dirpath = os.path.join(self.plugins_directory, plugin_name)
         if not os.path.isdir(dirpath):
@@ -420,7 +399,7 @@ class PluginManager(QtCore.QObject):
 
     def _remove_plugin(self, plugin_name, with_update=False):
         self._remove_plugin_files(plugin_name, with_update)
-        _unregister_module_extensions(plugin_name)
+        unregister_module_extensions(plugin_name)
         self.plugins = [p for p in self.plugins if p.module_name != plugin_name]
 
     def remove_plugin(self, plugin_name, with_update=False):
@@ -560,9 +539,9 @@ class PluginManager(QtCore.QObject):
 
 class PluginMetaPathFinder(MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
-        if not fullname.startswith(_PLUGIN_MODULE_PREFIX):
+        if not fullname.startswith(PLUGIN_MODULE_PREFIX):
             return None
-        plugin_name = fullname[len(_PLUGIN_MODULE_PREFIX):]
+        plugin_name = fullname[len(PLUGIN_MODULE_PREFIX):]
         for plugin_dir in plugin_dirs():
             for file_path in self._plugin_file_paths(plugin_dir, plugin_name):
                 if os.path.exists(file_path):

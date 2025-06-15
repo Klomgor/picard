@@ -38,9 +38,9 @@ from picard.const.sys import (
 )
 from picard.file import File
 from picard.metadata import Metadata
-from picard.util.tags import (
-    CALCULATED_TAGS,
-    FILE_INFO_TAGS,
+from picard.tags import (
+    calculated_tag_names,
+    file_info_tag_names,
 )
 
 
@@ -393,41 +393,49 @@ class FileAdditionalFilesPatternsTest(PicardTestCase):
     def test_simple_patterns(self):
         pattern = 'cover.jpg'
         expected = {
-            (re.compile('(?s:cover\\.jpg)\\Z', re.IGNORECASE), False)
+            (re.compile(r'(?s:cover\.jpg)\Z', re.IGNORECASE), False)
         }
-        self.assertEqual(File._compile_move_additional_files_pattern(pattern), expected)
+        self._assert_patterns_match(pattern, expected)
 
     def test_whitespaces_patterns(self):
         pattern = "  a   \n b   "
         expected = {
-            (re.compile('(?s:a)\\Z', re.IGNORECASE), False),
-            (re.compile('(?s:b)\\Z', re.IGNORECASE), False),
+            (re.compile(r'(?s:a)\Z', re.IGNORECASE), False),
+            (re.compile(r'(?s:b)\Z', re.IGNORECASE), False),
         }
-        self.assertEqual(File._compile_move_additional_files_pattern(pattern), expected)
+        self._assert_patterns_match(pattern, expected)
 
     def test_duplicated_patterns(self):
         pattern = 'cover.jpg cover.jpg COVER.JPG'
         expected = {
-            (re.compile('(?s:cover\\.jpg)\\Z', re.IGNORECASE), False)
+            (re.compile(r'(?s:cover\.jpg)\Z', re.IGNORECASE), False)
         }
-        self.assertEqual(File._compile_move_additional_files_pattern(pattern), expected)
+        self._assert_patterns_match(pattern, expected)
 
     def test_simple_hidden_patterns(self):
         pattern = 'cover.jpg .hidden'
         expected = {
-            (re.compile('(?s:cover\\.jpg)\\Z', re.IGNORECASE), False),
-            (re.compile('(?s:\\.hidden)\\Z', re.IGNORECASE), True)
+            (re.compile(r'(?s:cover\.jpg)\Z', re.IGNORECASE), False),
+            (re.compile(r'(?s:\.hidden)\Z', re.IGNORECASE), True)
         }
-        self.assertEqual(File._compile_move_additional_files_pattern(pattern), expected)
+        self._assert_patterns_match(pattern, expected)
 
     def test_wildcard_patterns(self):
         pattern = 'c?ver.jpg .h?dden* *.jpg *.JPG'
         expected = {
-            (re.compile('(?s:c.ver\\.jpg)\\Z', re.IGNORECASE), False),
-            (re.compile('(?s:\\.h.dden.*)\\Z', re.IGNORECASE), True),
-            (re.compile('(?s:.*\\.jpg)\\Z', re.IGNORECASE), False),
+            (re.compile(r'(?s:c.ver\.jpg)\Z', re.IGNORECASE), False),
+            (re.compile(r'(?s:\.h.dden.*)\Z', re.IGNORECASE), True),
+            (re.compile(r'(?s:.*\.jpg)\Z', re.IGNORECASE), False),
         }
-        self.assertEqual(File._compile_move_additional_files_pattern(pattern), expected)
+        self._assert_patterns_match(pattern, expected)
+
+    def _assert_patterns_match(self, pattern, expected):
+        compiled = File._compile_move_additional_files_pattern(pattern)
+        # With Python 3.14 the \Z regex flag was renamed to \z. Convert the old
+        # naming when comparing the patterns.
+        expected = {(p.pattern, h) for p, h in expected}
+        compiled = {(p.pattern.replace(r'\z', r'\Z'), h) for p, h in compiled}
+        self.assertEqual(compiled, expected)
 
 
 class FileUpdateTest(PicardTestCase):
@@ -619,7 +627,7 @@ class FileUpdateTest(PicardTestCase):
 
     def test_copy_file_info_tags(self):
         info_tags = {}
-        for info in FILE_INFO_TAGS:
+        for info in file_info_tag_names():
             info_tags[info] = 'val' + info
 
         orig_metadata = Metadata(info_tags)
@@ -629,7 +637,7 @@ class FileUpdateTest(PicardTestCase):
             'b': 'valb',
         })
         self.file._copy_file_info_tags(metadata, orig_metadata)
-        for info in FILE_INFO_TAGS:
+        for info in file_info_tag_names():
             self.assertEqual('val' + info, metadata[info])
         self.assertEqual('valb', metadata['b'])
         self.assertNotIn('a', metadata)
@@ -691,11 +699,11 @@ class FileCopyMetadataTest(PicardTestCase):
         self.assertEqual(self.file.metadata.deleted_tags, {'foo'})
 
     def test_copy_metadata_must_keep_file_content_specific_tags(self):
-        for tag in CALCULATED_TAGS:
+        for tag in calculated_tag_names():
             self.file.metadata[tag] = 'foo'
         new_metadata = Metadata()
         self.file.copy_metadata(new_metadata)
-        for tag in CALCULATED_TAGS:
+        for tag in calculated_tag_names():
             self.assertEqual(
                 self.file.metadata[tag], 'foo',
                 f'Tag {tag}: {self.file.metadata[tag]!r} != "foo"')

@@ -70,15 +70,20 @@ class ColumnSortType(IntEnum):
 
 
 class Column:
-    is_icon = False
     is_default = False
+    resizeable = True
+    sortable = True
 
-    def __init__(self, title, key, size=None, align=ColumnAlign.LEFT, sort_type=ColumnSortType.TEXT, sortkey=None):
+    def __init__(self, title, key, width=None, align=ColumnAlign.LEFT,
+                 sort_type=ColumnSortType.TEXT, sortkey=None, always_visible=False,
+                 status_icon=False):
         self.title = title
         self.key = key
-        self.size = size
+        self.width = width
         self.align = align
         self.sort_type = sort_type
+        self.always_visible = always_visible
+        self.status_icon = status_icon
         if self.sort_type == ColumnSortType.SORTKEY:
             if not callable(sortkey):
                 raise TypeError("sortkey should be a callable")
@@ -88,10 +93,11 @@ class Column:
 
     def __repr__(self):
         def parms():
+            opt_attrs = ('width', 'align', 'sort_type', 'sortkey', 'always_visible', 'status_icon')
             yield from (repr(getattr(self, a)) for a in ('title', 'key'))
-            yield from (a + '=' + repr(getattr(self, a)) for a in ('size', 'align', 'sort_type', 'sortkey'))
+            yield from (a + '=' + repr(getattr(self, a)) for a in opt_attrs)
 
-        return 'Column(' + ', '.join(parms()) + ')'
+        return self.__class__.__name__ + '(' + ', '.join(parms()) + ')'
 
     def __str__(self):
         return repr(self)
@@ -101,48 +107,22 @@ class DefaultColumn(Column):
     is_default = True
 
 
-class IconColumn(Column):
-    is_icon = True
-    _header_icon = None
-    header_icon_func = None
-    header_icon_size = QtCore.QSize(0, 0)
-    header_icon_border = 0
-    header_icon_size_with_border = QtCore.QSize(0, 0)
+class ImageColumn(Column):
+    resizeable = False
+    sortable = False
+    size = QtCore.QSize(0, 0)
 
-    @property
-    def header_icon(self):
-        # icon cannot be set before QApplication is created
-        # so create it during runtime and cache it
-        # Avoid error: QPixmap: Must construct a QGuiApplication before a QPixmap
-        if self._header_icon is None:
-            self._header_icon = self.header_icon_func()
-        return self._header_icon
-
-    def set_header_icon_size(self, width, height, border):
-        self.header_icon_size = QtCore.QSize(width, height)
-        self.header_icon_border = border
-        self.header_icon_size_with_border = QtCore.QSize(width + 2*border, height + 2*border)
-
-    def paint_icon(self, painter, rect):
-        icon = self.header_icon
-        if not icon:
-            return
-        h = self.header_icon_size.height()
-        w = self.header_icon_size.width()
-        border = self.header_icon_border
-        padding_v = (rect.height() - h) // 2
-        target_rect = QtCore.QRect(
-            rect.x() + border, rect.y() + padding_v,
-            w, h
-        )
-        painter.drawPixmap(target_rect, icon.pixmap(self.header_icon_size))
+    def paint(self, painter, rect):
+        raise NotImplementedError
 
 
 class Columns(MutableSequence):
-    def __init__(self, iterable=None):
+    def __init__(self, iterable=None, default_width=None):
         self._list = list()
         self._index = dict()
         self._index_dirty = True
+        self.status_icon_column = None
+        self.default_width = default_width
         if iterable is not None:
             for e in iterable:
                 self.append(e)
@@ -154,17 +134,24 @@ class Columns(MutableSequence):
         self._index_dirty = True
         self._list.__delitem__(index)
 
-    def insert(self, index, column):
+    def _new_column(self, index, column):
         if not isinstance(column, Column):
             raise TypeError("Not an instance of Column")
-        self._list.insert(index, column)
         self._index_dirty = True
+        if column.status_icon:
+            if self.status_icon_column is not None:
+                raise TypeError("Only one status icon column is supported")
+            self.status_icon_column = index
+        if self.default_width is not None and column.width is None:
+            column.width = self.default_width
+
+    def insert(self, index, column):
+        self._new_column(index, column)
+        self._list.insert(index, column)
 
     def __setitem__(self, index, column):
-        if not isinstance(column, Column):
-            raise TypeError("Not an instance of Column")
+        self._new_column(index, column)
         self._list.__setitem__(index, column)
-        self._index_dirty = True
 
     def __getitem__(self, index):
         return self._list.__getitem__(index)
@@ -180,3 +167,13 @@ class Columns(MutableSequence):
 
     def __str__(self):
         return repr(self)
+
+    def always_visible_columns(self):
+        for i, c in enumerate(self._list):
+            if c.always_visible:
+                yield i
+
+    def get_column_by_key(self, key):
+        """Returns position and column instance for a given key"""
+        pos = self.pos(key)
+        return pos, self[pos]
