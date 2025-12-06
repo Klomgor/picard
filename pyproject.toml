@@ -43,6 +43,9 @@ dependencies = [
     "pywin32; sys_platform == 'win32'",
     "PyYAML>=5.1, <7",
     "charset-normalizer~=3.3",
+    "tomlkit~=0.12; python_version < '3.11'",
+    "pygit2~=1.18; python_version < '3.14'",
+    "pygit2~=1.19; python_version >= '3.14'",
 ]
 
 [dependency-groups]
@@ -61,6 +64,7 @@ dev = [
     "pytest-randomly>=4.0.1",
     "pytest-xdist>=3.8.0",
     "ruff>=0.12.8",
+    "urllib3>=2.6.0",
     "wlc",
 ]
 plugins = [
